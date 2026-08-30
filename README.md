@@ -1,5 +1,9 @@
 # [Control Panel for Twitter](https://soitis.dev/control-panel-for-twitter)
 
+> This fork adds a one-click **Print** button to individual X post pages. It
+> creates a clean print preview for long-form X Articles and loaded same-author
+> threads, including images, ready to print or save as PDF.
+
 [![](icons/icon128.png)](https://soitis.dev/control-panel-for-twitter)
 
 **Control Panel for Twitter is a browser extension for desktop and mobile browsers, which gives you more control over Twitter and adds missing features and UI improvements**

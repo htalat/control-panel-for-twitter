@@ -3022,6 +3022,284 @@ function setTweetButtonText($tweetButtonText) {
 function storeConfigChanges(changes) {
   window.postMessage({type: 'cpftConfigChange', changes})
 }
+
+//#region Print articles and threads
+function getPrintableHtml($root, removeSelector = '') {
+  if (!$root) return ''
+  let $clone = $root.cloneNode(true)
+  if (removeSelector) {
+    $clone.querySelectorAll(removeSelector).forEach($element => $element.remove())
+  }
+  for (let $premiumLink of $clone.querySelectorAll('a[href*="/i/premium"]')) {
+    let $upsell = $premiumLink
+    while ($upsell.parentElement && $upsell.parentElement !== $clone) {
+      $upsell = $upsell.parentElement
+      if (/want to publish your own article/i.test($upsell.textContent)) break
+    }
+    if (/want to publish your own article/i.test($upsell.textContent)) {
+      $upsell.remove()
+    } else {
+      $premiumLink.remove()
+    }
+  }
+  for (let $element of Array.from($clone.querySelectorAll('*'))) {
+    let text = $element.textContent.replace(/\s+/g, ' ').trim()
+    if (/^(?:want to publish your own article\?|upgrade to premium)$/i.test(text)) {
+      $element.remove()
+    }
+  }
+  $clone.querySelectorAll('script, style, button, [role="button"], svg').forEach($element => $element.remove())
+  $clone.querySelectorAll('*').forEach($element => {
+    for (let attribute of Array.from($element.attributes)) {
+      if (!['href', 'src', 'alt', 'title'].includes(attribute.name)) {
+        $element.removeAttribute(attribute.name)
+      }
+    }
+    for (let urlAttribute of ['href', 'src']) {
+      if (!$element.hasAttribute(urlAttribute)) continue
+      try {
+        let url = new URL($element.getAttribute(urlAttribute), location.href)
+        if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported URL')
+        $element.setAttribute(urlAttribute, url.href)
+      } catch {
+        $element.removeAttribute(urlAttribute)
+      }
+    }
+  })
+  return $clone.innerHTML
+}
+
+function getPrintableDocument() {
+  let pathMatch = URL_TWEET_BASE_RE.exec(location.pathname)
+  if (!pathMatch) return null
+  let [, author, statusId] = pathMatch
+  let $primaryColumn = document.querySelector(Selectors.PRIMARY_COLUMN) || document.querySelector('main, [role="main"]')
+  let $focusedTweet = document.querySelector(`${Selectors.TWEET}[tabindex="-1"]`) ||
+    document.querySelector(`${Selectors.PRIMARY_COLUMN} ${Selectors.TWEET}`) ||
+    document.querySelector('main article, main [role="article"]')
+  let $articleView = document.querySelector('[data-testid="twitterArticleReadView"], [data-testid="twitter-article-body"]')
+  let $explicitTitle = document.querySelector('[data-testid="twitter-article-title"]') ||
+    $articleView?.querySelector('h1, [role="heading"][aria-level="1"]')
+  let $title = $explicitTitle || Array.from(new Set([
+    ...($focusedTweet?.querySelectorAll('h1, [role="heading"][aria-level="1"]') || []),
+    ...($primaryColumn?.querySelectorAll('h1, [role="heading"]') || []),
+  ])).find($heading => {
+    let text = $heading.textContent.replace(/\s+/g, ' ').trim()
+    return text.length > 15 && text.length < 220 &&
+      !/^(post|tweet)$/i.test(text) &&
+      !/^[^:]+ on X:/i.test(text) &&
+      !$heading.closest('a[href*="/status/"], [role="link"][href*="/status/"]')
+  })
+
+  if ($title || $articleView) {
+    let $container = $articleView || $title.parentElement
+    while ($container &&
+           $container !== $primaryColumn &&
+           $container.textContent.trim().length < 600 &&
+           $container.querySelectorAll('p, li, [data-testid="twitterArticleReadView"] div[dir]').length < 3) {
+      $container = $container.parentElement
+    }
+    if ($container && ($articleView || $container.textContent.trim().length >= 600)) {
+      let title = $title?.textContent.trim() ||
+        $container.textContent.trim().split('\n').find(line => line.trim().length > 15)?.trim() ||
+        'X Article'
+      return {
+        type: 'article',
+        title,
+        author,
+        date: $focusedTweet?.querySelector('time')?.dateTime || '',
+        blocks: [{html: getPrintableHtml($container, 'h1, [role="heading"][aria-level="1"]')}],
+      }
+    }
+  }
+
+  let blocks = []
+  let foundFocusedPost = false
+  for (let $tweet of document.querySelectorAll(Selectors.TWEET)) {
+    let $permalink = $tweet.querySelector('time')?.closest('a[href*="/status/"]') ||
+      Array.from($tweet.querySelectorAll('a[href*="/status/"]')).find($link =>
+      /^\/[a-zA-Z\d_]{1,20}\/status\/\d+/.test($link.getAttribute('href') || '')
+    )
+    let $text = $tweet.querySelector('[data-testid="tweetText"]')
+    if (!$permalink || !$text) continue
+    let postMatch = /^\/([a-zA-Z\d_]{1,20})\/status\/(\d+)/.exec($permalink.pathname)
+    if (!postMatch) continue
+    let [, postAuthor, postId] = postMatch
+    if (!foundFocusedPost) {
+      if (postId != statusId) continue
+      foundFocusedPost = true
+    }
+    else if (postAuthor.toLowerCase() != author.toLowerCase()) {
+      // A self-thread is rendered consecutively. Once another account appears,
+      // later posts by the author are ordinary conversation replies.
+      break
+    }
+    if (blocks.some(block => block.url == $permalink.href)) continue
+    blocks.push({
+      html: getPrintableHtml($text),
+      images: Array.from($tweet.querySelectorAll('[data-testid="tweetPhoto"] img')).map($image => ({
+        src: $image.currentSrc || $image.src,
+        alt: $image.alt,
+      })),
+      url: $permalink.href,
+      date: $tweet.querySelector('time')?.dateTime || '',
+    })
+  }
+  if (!blocks.length) return null
+  let title = blocks[0].html.replace(/<[^>]+>/g, '').trim()
+  return {
+    type: blocks.length > 1 ? 'thread' : 'post',
+    title: title.length > 100 ? `${title.slice(0, 100)}…` : title,
+    author,
+    date: blocks[0].date,
+    blocks,
+  }
+}
+
+function openPrintView() {
+  let printable = getPrintableDocument()
+  if (!printable) {
+    let diagnostics = [
+      `path=${location.pathname}`,
+      `h1=${document.querySelectorAll('h1').length}`,
+      `headings=${document.querySelectorAll('[role="heading"]').length}`,
+      `tweets=${document.querySelectorAll(Selectors.TWEET).length}`,
+      `text=${(document.querySelector(Selectors.PRIMARY_COLUMN) || document.querySelector('main'))?.textContent.length || 0}`,
+    ].join(', ')
+    alert(`Could not find an article or thread on this page. (${diagnostics})`)
+    return
+  }
+  let printWindow = window.open('', '_blank')
+  if (!printWindow) {
+    alert('Allow pop-ups from x.com to open the print preview.')
+    return
+  }
+  let date = printable.date ? new Intl.DateTimeFormat(undefined, {dateStyle: 'long'}).format(new Date(printable.date)) : ''
+  let $document = printWindow.document
+  $document.title = `${printable.title} — Print view`
+  $document.documentElement.lang = document.documentElement.lang || 'en'
+  $document.body.innerHTML = `
+    <nav><strong>Print view</strong><button type="button">Print / Save PDF</button></nav>
+    <main class="${printable.type}">
+      <header><h1></h1><p class="byline"></p></header>
+      <div id="content"></div>
+      <footer>Source: <a></a></footer>
+    </main>`
+  let $style = $document.createElement('style')
+  $style.textContent = `
+    *{box-sizing:border-box}body{margin:0;background:#eef1f3;color:#17202a;font:17px/1.68 Georgia,serif}
+    nav{position:sticky;top:0;display:flex;justify-content:space-between;align-items:center;padding:12px 22px;background:#fffffff2;border-bottom:1px solid #d9e0e5;font:700 14px system-ui;z-index:2}
+    button{border:0;border-radius:999px;padding:10px 16px;background:#0f1419;color:#fff;font:700 13px system-ui;cursor:pointer}
+    main{width:min(760px,calc(100% - 32px));min-height:80vh;margin:34px auto;padding:64px 72px;background:#fff;box-shadow:0 2px 18px #0f141914}
+    h1{margin:0 0 18px;font:750 clamp(32px,5vw,48px)/1.08 system-ui;letter-spacing:-.04em}.byline{margin:0 0 42px;color:#657786;font:14px system-ui}
+    section{margin:0 0 30px}.thread{counter-reset:post}.thread section{padding:0 0 30px 28px;border-left:3px solid #d9e0e5;break-inside:avoid}
+    .thread section:before{content:counter(post);counter-increment:post;float:left;width:24px;height:24px;margin:2px 0 0 -42px;border-radius:50%;background:#1d9bf0;color:#fff;text-align:center;font:700 12px/24px system-ui}
+    p{margin:0 0 1em}a{color:#1478b8;text-decoration:none}img{max-width:100%;height:auto;border-radius:8px;margin-top:14px}.permalink{display:block;margin-top:12px;color:#657786;font:12px system-ui}
+    footer{padding-top:22px;border-top:1px solid #d9e0e5;color:#657786;font:12px/1.5 system-ui;overflow-wrap:anywhere}
+    @media(max-width:620px){main{width:100%;margin:0;padding:42px 25px}}
+    @media print{@page{margin:18mm 17mm 20mm}body{background:#fff;color:#111}nav{display:none}main{width:100%;min-height:0;margin:0;padding:0;box-shadow:none}h1{font-size:32pt}a{color:#111}.article section{break-inside:auto}.thread section{break-inside:avoid}}
+  `
+  $document.head.append($style)
+  $document.querySelector('h1').textContent = printable.title
+  $document.querySelector('.byline').textContent = `@${printable.author}${date ? ` · ${date}` : ''}`
+  let $content = $document.querySelector('#content')
+  for (let block of printable.blocks) {
+    let $section = $document.createElement('section')
+    let $text = $document.createElement('div')
+    $text.innerHTML = block.html
+    $section.append($text)
+    for (let image of block.images || []) {
+      let $image = $document.createElement('img')
+      $image.src = image.src
+      $image.alt = image.alt
+      $section.append($image)
+    }
+    if (block.url) {
+      let $link = $document.createElement('a')
+      $link.className = 'permalink'
+      $link.href = block.url
+      $link.textContent = 'View original post'
+      $section.append($link)
+    }
+    $content.append($section)
+  }
+  let $source = $document.querySelector('footer a')
+  $source.href = location.href
+  $source.textContent = location.href
+  $document.querySelector('button').addEventListener('click', () => printWindow.print())
+}
+
+async function addPrintButton({observe = true} = {}) {
+  if (document.querySelector('#cpftPrintButton')) return
+  let $bookmarkButton = await getElement(`${Selectors.TWEET}[tabindex="-1"] [data-testid$="bookmark"], ${Selectors.PRIMARY_COLUMN} [data-testid$="bookmark"], ${Selectors.PRIMARY_COLUMN} [aria-label*="Bookmark"], main article [aria-label*="Bookmark"], main [role="article"] [aria-label*="Bookmark"]`, {
+    name: 'focused post bookmark button for print action',
+    stopIf: pageIsNot(currentPage),
+  })
+  if (!$bookmarkButton || !isOnIndividualTweetPage()) return
+  let $actionRow = $bookmarkButton.parentElement
+  while ($actionRow && $actionRow !== document.body &&
+         Array.from($actionRow.children).filter($child =>
+           $child.matches('button, [role="button"]') || $child.querySelector('button, [role="button"]')
+         ).length < 3) {
+    $actionRow = $actionRow.parentElement
+  }
+  if (!$actionRow || $actionRow === document.body) return
+  let $bookmarkSlot = Array.from($actionRow.children).find($child =>
+    $child === $bookmarkButton || $child.contains($bookmarkButton)
+  )
+  if (!$bookmarkSlot) return
+  let $actionSlot = $bookmarkSlot.cloneNode(true)
+  $actionSlot.id = 'cpftPrintButtonContainer'
+  let $button = $actionSlot.matches('button, [role="button"]') ? $actionSlot :
+    $actionSlot.querySelector('[data-testid$="bookmark"], button, [role="button"]')
+  if (!$button) return
+  if ($actionSlot !== $button) {
+    Array.from($actionSlot.children).forEach($sibling => {
+      if ($sibling !== $button && !$sibling.contains($button)) {
+        $sibling.remove()
+      }
+    })
+    $actionSlot.querySelectorAll('button, [role="button"]').forEach($otherButton => {
+      if ($otherButton !== $button && !$otherButton.contains($button)) {
+        $otherButton.remove()
+      }
+    })
+  }
+  $button.id = 'cpftPrintButton'
+  $button.removeAttribute('data-testid')
+  $button.title = 'Create a clean print view of this article or thread'
+  $button.setAttribute('aria-label', 'Print article or thread')
+  let $svg = $button.querySelector('svg')
+  if ($svg) {
+    let $bookmarkSvg = $bookmarkButton.querySelector('svg')
+    let bookmarkIconColor = $bookmarkSvg ? getComputedStyle($bookmarkSvg).fill : getComputedStyle($bookmarkButton).color
+    $svg = $svg.cloneNode(true)
+    $button.replaceChildren($svg)
+    $button.style.color = bookmarkIconColor
+    $svg.setAttribute('viewBox', '0 0 24 24')
+    $svg.innerHTML = '<path d="M7 3h10v4H7V3zm10 10v8H7v-8h10zm2-4c1.66 0 3 1.34 3 3v5h-3v-6H5v6H2v-5c0-1.66 1.34-3 3-3h14zm-4 6H9v4h6v-4z"></path>'
+  }
+  $button.addEventListener('click', openPrintView)
+  $bookmarkSlot.insertAdjacentElement('beforebegin', $actionSlot)
+
+  if (observe) {
+    let $printObserverRoot = $bookmarkButton.closest('article, [role="article"]')?.parentElement || $actionRow.parentElement
+    if ($printObserverRoot) {
+      observeElement($printObserverRoot, () => {
+        if (!document.querySelector('#cpftPrintButton')) {
+          addPrintButton({observe: false})
+        }
+      }, {
+        name: 'focused post container for print action',
+        observers: pageObservers,
+      }, {
+        childList: true,
+        subtree: true,
+      })
+    }
+  }
+}
+//#endregion
 //#endregion
 
 //#region Global observers
@@ -5415,6 +5693,12 @@ const configureThemeCss = (() => {
 
     let cssRules = []
 
+    cssRules.push(`
+      #cpftPrintButton svg { fill: currentColor; }
+      #cpftPrintButtonContainer:hover #cpftPrintButton { color: var(--cpft-theme, ${THEME_BLUE}) !important; }
+      @media print { #cpftPrintButtonContainer { display: none !important; } }
+    `)
+
     if (themeColor != null) {
       cssRules.push(`
         body {
@@ -6773,6 +7057,7 @@ function processTwitterLogos($el) {
 
 function processCurrentPage() {
   disconnectObservers(pageObservers, 'page')
+  document.querySelector('#cpftPrintButtonContainer')?.remove()
 
   // Hooks for styling pages
   if (!$body) $body = document.body
@@ -7387,6 +7672,7 @@ async function tweakFollowListPage() {
 async function tweakIndividualTweetPage() {
   userSortedReplies = false
   observeIndividualTweetTimeline(currentPage)
+  addPrintButton()
 
   if (config.replaceLogo) {
     (async () => {
